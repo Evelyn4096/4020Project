@@ -83,3 +83,5 @@ dump/
 # Other
 # ==========================
 *.local
+
+node_modules/
