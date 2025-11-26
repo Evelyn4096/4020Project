@@ -6,32 +6,29 @@ import { WebSocketServer } from "ws";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 dotenv.config();
 
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-
-/* =======================
- * 1. Example Middleware
- * ======================= */
-function validateAdd(req, res, next) {
+//middleware
+app.get("/api/add", (req, res) => {
   const a = Number(req.query.a);
   const b = Number(req.query.b);
   if (isNaN(a) || isNaN(b)) {
-    return res.status(400).json({ error: "a and b must be valid numbers" });
+    return res.status(400).json({ error: "Invalid numbers" });
   }
-  next();
-}
-
-app.get("/api/add", validateAdd, (req, res) => {
-  const a = Number(req.query.a);
-  const b = Number(req.query.b);
   res.json({ result: a + b });
 });
 
+/* ======================================
+ * GLOBAL EVALUATION CONTROL FLAGS
+ * ====================================== */
+let evaluationPaused = false;
+let evaluationStopped = false;
+let isRunning = false;
+
 /* =======================
- * 2. MongoDB Setup
+ * MongoDB Setup
  * ======================= */
 const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
@@ -43,27 +40,52 @@ const domainCollections = {
   Social_Science: db.collection("Social_Science"),
 };
 
+/* ======================================
+ * Reset / Pause / Resume — MUST appear
+ * AFTER domainCollections declaration
+ * ====================================== */
+
+// Pause
+app.post("/api/evaluations/pause", (req, res) => {
+  evaluationPaused = true;
+  res.json({ status: "paused" });
+});
+
+// Resume
+app.post("/api/evaluations/resume", (req, res) => {
+  evaluationPaused = false;
+  res.json({ status: "resumed" });
+});
+
+// Reset = stop evaluation + signal front-end to clear log
+app.post("/api/evaluations/reset", async (req, res) => {
+  evaluationStopped = true;
+  evaluationPaused = false;
+  isRunning = false;
+
+  // 通知前端清空 log
+  broadcast({ status: "reset" });
+
+  res.json({ status: "reset-complete" });
+});
 /* =======================
- * 3. Gemini Setup
+ * Gemini Setup
  * ======================= */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-/* =======================
- * 4. Extract A/B/C/D
- * ======================= */
 function extractLetter(text) {
   const m = text.trim().toUpperCase().match(/\b[A-D]\b/);
   return m ? m[0] : "";
 }
 
 /* =======================
- * 5. WebSocket
+ * WebSocket Setup
  * ======================= */
 const wss = new WebSocketServer({ noServer: true });
 const clients = new Set();
 
-wss.on("connection", ws => {
+wss.on("connection", (ws) => {
   clients.add(ws);
   ws.on("close", () => clients.delete(ws));
 });
@@ -74,20 +96,33 @@ function broadcast(msg) {
   }
 }
 
-/* ==============================
- * 6. Evaluation (Gemini only)
- * ============================== */
+/* ======================================
+ * Start Evaluation
+ * ====================================== */
 app.post("/api/evaluations/start", async (req, res) => {
+  if (isRunning) return res.json({ status: "already-running" });
+
+  isRunning = true;
+  evaluationStopped = false;
+
   res.json({ status: "Evaluation started" });
 
   for (const [domain, col] of Object.entries(domainCollections)) {
     const docs = await col.find().toArray();
-    console.log(`Evaluating domain: ${domain} (${docs.length} questions)`);
 
     for (let q of docs) {
-      const prompt = `
-You are answering a multiple-choice question. Choices:
+      if (evaluationStopped) {
+        broadcast({ status: "stopped" });
+        isRunning = false;
+        return;
+      }
 
+      while (evaluationPaused) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+
+      // Ask Gemini
+      const prompt = `
 A: ${q.choices.A}
 B: ${q.choices.B}
 C: ${q.choices.C}
@@ -95,10 +130,8 @@ D: ${q.choices.D}
 
 Question: ${q.question}
 
-IMPORTANT:
-- Only answer with ONE letter: A, B, C, or D.
-- No explanation.
-      `.trim();
+Answer with exactly one letter (A-D). No explanation.
+`.trim();
 
       const start = Date.now();
 
@@ -107,8 +140,7 @@ IMPORTANT:
         const result = await model.generateContent(prompt);
         const response = await result.response;
         rawAnswer = await response.text();
-      } catch (err) {
-        console.error("Gemini API Error:", err);
+      } catch (e) {
         rawAnswer = "(error)";
       }
 
@@ -138,10 +170,93 @@ IMPORTANT:
   }
 
   broadcast({ status: "done" });
+  isRunning = false;
 });
 
+/* ======================================
+ * Quick Evaluation (50 per domain)
+ * ====================================== */
+app.post("/api/evaluations/quick", async (req, res) => {
+  if (isRunning) return res.json({ status: "already-running" });
+
+  isRunning = true;
+  evaluationStopped = false;
+
+  res.json({ status: "Quick Evaluation started" });
+
+  for (const [domain, col] of Object.entries(domainCollections)) {
+    // Pick random 50 documents
+    const docs = await col.aggregate([{ $sample: { size: 50 } }]).toArray();
+
+    broadcast({ status: "domain-start", domain, count: docs.length });
+
+    for (let q of docs) {
+      if (evaluationStopped) {
+        broadcast({ status: "stopped" });
+        isRunning = false;
+        return;
+      }
+
+      while (evaluationPaused) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+
+      // Ask Gemini
+      const prompt = `
+A: ${q.choices.A}
+B: ${q.choices.B}
+C: ${q.choices.C}
+D: ${q.choices.D}
+
+Question: ${q.question}
+
+Answer with exactly one letter (A-D). No explanation.
+      `.trim();
+
+      const start = Date.now();
+
+      let rawAnswer = "";
+      try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        rawAnswer = await response.text();
+      } catch (e) {
+        rawAnswer = "(error)";
+      }
+
+      const end = Date.now();
+      const responseTime = end - start;
+      const letter = extractLetter(rawAnswer);
+
+      // Update database
+      await col.updateOne(
+        { _id: q._id },
+        {
+          $set: {
+            chatgpt_response: letter,
+            raw_gpt_text: rawAnswer,
+            responseTime,
+            evaluatedAt: new Date(),
+          },
+        }
+      );
+
+      broadcast({
+        domain,
+        question: q.question,
+        answer: letter,
+        responseTime,
+      });
+    }
+  }
+
+  broadcast({ status: "quick-done" });
+  isRunning = false;
+});
+
+
 /* =======================
- * 7. Analysis Endpoint
+ * Analysis Endpoint
  * ======================= */
 app.get("/api/analysis", async (req, res) => {
   const results = [];
@@ -150,24 +265,19 @@ app.get("/api/analysis", async (req, res) => {
     const docs = await col.find().toArray();
     if (!docs.length) continue;
 
-    const correct = docs.filter(d =>
-      d.chatgpt_response &&
-      d.expected_answer &&
-      d.chatgpt_response.trim().toUpperCase() ===
-        d.expected_answer.trim().toUpperCase()
+    const correct = docs.filter(
+      (d) =>
+        d.chatgpt_response &&
+        d.expected_answer &&
+        d.chatgpt_response.toUpperCase() === d.expected_answer.toUpperCase()
     ).length;
-
-    const accuracy = correct / docs.length;
-
-    const avgResponseTime =
-      docs.reduce((sum, d) => sum + (d.responseTime || 0), 0) /
-      docs.length;
 
     results.push({
       domain,
       count: docs.length,
-      accuracy,
-      avgResponseTime,
+      accuracy: correct / docs.length,
+      avgResponseTime:
+        docs.reduce((s, d) => s + (d.responseTime || 0), 0) / docs.length,
     });
   }
 
@@ -175,11 +285,11 @@ app.get("/api/analysis", async (req, res) => {
 });
 
 /* =======================
- * 8. Start Server
+ * Start Server
  * ======================= */
 const PORT = process.env.PORT || 3000;
 
-const server = app.listen(PORT, "0.0.0.0",() =>
+const server = app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Server running on port ${PORT}`)
 );
 
@@ -189,6 +299,6 @@ server.on("upgrade", (req, socket, head) => {
       wss.emit("connection", ws, req);
     });
   } else {
-    socket.destroy(); // ❗ 必须丢弃非 WS 请求
+    socket.destroy();
   }
 });
