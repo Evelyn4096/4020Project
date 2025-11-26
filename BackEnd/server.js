@@ -6,9 +6,11 @@ import { WebSocketServer } from "ws";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 dotenv.config();
 
+
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 
 /* =======================
  * 1. Example Middleware
@@ -175,12 +177,14 @@ app.get("/api/analysis", async (req, res) => {
 /* =======================
  * 8. Start Server
  * ======================= */
-const server = app.listen(3000, () =>
-  console.log("Server running on http://localhost:3000")
+const PORT = process.env.PORT || 3000;
+
+const server = app.listen(PORT, "0.0.0.0",() =>
+  console.log(`🚀 Server running on port ${PORT}`)
 );
 
 server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, ws => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit("connection", ws, req);
   });
 });
