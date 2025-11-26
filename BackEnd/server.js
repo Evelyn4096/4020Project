@@ -1,92 +1,63 @@
-/**
- * ============================================================
- * ChatGPT Evaluation Backend (Express + WebSocket + MongoDB)
- * Course Project – Interactive Website + AI Evaluation
- * Implemented Requirements:
- *   ✔ Client-side middleware example: /api/add?a=2&b=3
- *   ✔ WebSocket real-time status updates
- *   ✔ ChatGPT evaluation pipeline
- *   ✔ MongoDB storage for 3 domains
- *   ✔ /api/analysis endpoint for Chart.js visualization
- *   ✔ Clean, well-organized backend for demonstration
- * ============================================================
- */
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import { WebSocketServer } from "ws";
-import OpenAI from "openai";
-
+import { GoogleGenerativeAI } from "@google/generative-ai";
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ============================================================
- * 1. Example Middleware Route (Assignment MUST-HAVE)
- * ============================================================
- */
-
-// middleware - validate query parameters
+/* =======================
+ * 1. Example Middleware
+ * ======================= */
 function validateAdd(req, res, next) {
   const a = Number(req.query.a);
   const b = Number(req.query.b);
-
   if (isNaN(a) || isNaN(b)) {
     return res.status(400).json({ error: "a and b must be valid numbers" });
   }
   next();
 }
 
-// GET /api/add?a=2&b=3 → { result: 5 }
 app.get("/api/add", validateAdd, (req, res) => {
   const a = Number(req.query.a);
   const b = Number(req.query.b);
   res.json({ result: a + b });
 });
 
-/* ============================================================
+/* =======================
  * 2. MongoDB Setup
- * ============================================================
- */
-
+ * ======================= */
 const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
 const db = client.db("newChatGPT_Evaluation");
 
-// Collections for 3 domains
 const domainCollections = {
   Computer_Security: db.collection("Computer_Security"),
   History: db.collection("History"),
   Social_Science: db.collection("Social_Science"),
 };
 
-/* ============================================================
- * 3. Helper: Extract A/B/C/D letter from GPT output
- * ============================================================
- */
+/* =======================
+ * 3. Gemini Setup
+ * ======================= */
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+/* =======================
+ * 4. Extract A/B/C/D
+ * ======================= */
 function extractLetter(text) {
-  const m = text.trim().toUpperCase().match(/[ABCD]/);
+  const m = text.trim().toUpperCase().match(/\b[A-D]\b/);
   return m ? m[0] : "";
 }
 
-/* ============================================================
- * 4. OpenAI Setup
- * ============================================================
- */
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-/* ============================================================
- * 5. WebSocket Setup (Real-Time Evaluation Updates)
- * ============================================================
- */
-
+/* =======================
+ * 5. WebSocket
+ * ======================= */
 const wss = new WebSocketServer({ noServer: true });
 const clients = new Set();
 
@@ -95,37 +66,24 @@ wss.on("connection", ws => {
   ws.on("close", () => clients.delete(ws));
 });
 
-// broadcast results to all connected clients
 function broadcast(msg) {
   for (let c of clients) {
     c.send(JSON.stringify(msg));
   }
 }
 
-/* ============================================================
- * 6. ChatGPT Evaluation Logic
- * Endpoint: POST /api/evaluations/start
- * ============================================================
- */
-
+/* ==============================
+ * 6. Evaluation (Gemini only)
+ * ============================== */
 app.post("/api/evaluations/start", async (req, res) => {
-  // respond immediately (frontend can see "started")
   res.json({ status: "Evaluation started" });
 
-  // evaluate domain by domain
   for (const [domain, col] of Object.entries(domainCollections)) {
     const docs = await col.find().toArray();
     console.log(`Evaluating domain: ${domain} (${docs.length} questions)`);
 
     for (let q of docs) {
-      const start = Date.now();
-
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          {
-            role: "user",
-            content: `
+      const prompt = `
 You are answering a multiple-choice question. Choices:
 
 A: ${q.choices.A}
@@ -138,18 +96,24 @@ Question: ${q.question}
 IMPORTANT:
 - Only answer with ONE letter: A, B, C, or D.
 - No explanation.
-            `,
-          },
-        ],
-      });
+      `.trim();
+
+      const start = Date.now();
+
+      let rawAnswer = "";
+      try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        rawAnswer = await response.text();
+      } catch (err) {
+        console.error("Gemini API Error:", err);
+        rawAnswer = "(error)";
+      }
 
       const end = Date.now();
       const responseTime = end - start;
-
-      const rawAnswer = completion.choices[0].message.content;
       const letter = extractLetter(rawAnswer);
 
-      // update MongoDB
       await col.updateOne(
         { _id: q._id },
         {
@@ -162,7 +126,6 @@ IMPORTANT:
         }
       );
 
-      // send real-time WS update
       broadcast({
         domain,
         question: q.question,
@@ -172,15 +135,12 @@ IMPORTANT:
     }
   }
 
-  // notify frontend evaluation is fully completed
   broadcast({ status: "done" });
 });
 
-/* ============================================================
- * 7. Analysis Endpoint (For Chart.js Graphs)
- * ============================================================
- */
-
+/* =======================
+ * 7. Analysis Endpoint
+ * ======================= */
 app.get("/api/analysis", async (req, res) => {
   const results = [];
 
@@ -188,7 +148,6 @@ app.get("/api/analysis", async (req, res) => {
     const docs = await col.find().toArray();
     if (!docs.length) continue;
 
-    // compute accuracy
     const correct = docs.filter(d =>
       d.chatgpt_response &&
       d.expected_answer &&
@@ -198,7 +157,6 @@ app.get("/api/analysis", async (req, res) => {
 
     const accuracy = correct / docs.length;
 
-    // compute avg response time
     const avgResponseTime =
       docs.reduce((sum, d) => sum + (d.responseTime || 0), 0) /
       docs.length;
@@ -214,11 +172,9 @@ app.get("/api/analysis", async (req, res) => {
   res.json(results);
 });
 
-/* ============================================================
- * 8. Start Server + WebSocket Upgrade
- * ============================================================
- */
-
+/* =======================
+ * 8. Start Server
+ * ======================= */
 const server = app.listen(3000, () =>
   console.log("Server running on http://localhost:3000")
 );
