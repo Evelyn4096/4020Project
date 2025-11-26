@@ -1,8 +1,22 @@
+/**
+ * ============================================================
+ * ChatGPT Evaluation Backend (Express + WebSocket + MongoDB)
+ * Course Project – Interactive Website + AI Evaluation
+ * Implemented Requirements:
+ *   ✔ Client-side middleware example: /api/add?a=2&b=3
+ *   ✔ WebSocket real-time status updates
+ *   ✔ ChatGPT evaluation pipeline
+ *   ✔ MongoDB storage for 3 domains
+ *   ✔ /api/analysis endpoint for Chart.js visualization
+ *   ✔ Clean, well-organized backend for demonstration
+ * ============================================================
+ */
+
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import { WebSocketServer } from "ws";
-import dotenv from "dotenv";
 import OpenAI from "openai";
 
 dotenv.config();
@@ -11,42 +25,181 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- MongoDB ---
+/* ============================================================
+ * 1. Example Middleware Route (Assignment MUST-HAVE)
+ * ============================================================
+ */
+
+// middleware - validate query parameters
+function validateAdd(req, res, next) {
+  const a = Number(req.query.a);
+  const b = Number(req.query.b);
+
+  if (isNaN(a) || isNaN(b)) {
+    return res.status(400).json({ error: "a and b must be valid numbers" });
+  }
+  next();
+}
+
+// GET /api/add?a=2&b=3 → { result: 5 }
+app.get("/api/add", validateAdd, (req, res) => {
+  const a = Number(req.query.a);
+  const b = Number(req.query.b);
+  res.json({ result: a + b });
+});
+
+/* ============================================================
+ * 2. MongoDB Setup
+ * ============================================================
+ */
+
 const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
 const db = client.db("newChatGPT_Evaluation");
 
-// 三个 domain 的 collection
+// Collections for 3 domains
 const domainCollections = {
   Computer_Security: db.collection("Computer_Security"),
   History: db.collection("History"),
   Social_Science: db.collection("Social_Science"),
 };
 
-// --- Analysis (accuracy + response time) ---
+/* ============================================================
+ * 3. Helper: Extract A/B/C/D letter from GPT output
+ * ============================================================
+ */
+function extractLetter(text) {
+  const m = text.trim().toUpperCase().match(/[ABCD]/);
+  return m ? m[0] : "";
+}
+
+/* ============================================================
+ * 4. OpenAI Setup
+ * ============================================================
+ */
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+/* ============================================================
+ * 5. WebSocket Setup (Real-Time Evaluation Updates)
+ * ============================================================
+ */
+
+const wss = new WebSocketServer({ noServer: true });
+const clients = new Set();
+
+wss.on("connection", ws => {
+  clients.add(ws);
+  ws.on("close", () => clients.delete(ws));
+});
+
+// broadcast results to all connected clients
+function broadcast(msg) {
+  for (let c of clients) {
+    c.send(JSON.stringify(msg));
+  }
+}
+
+/* ============================================================
+ * 6. ChatGPT Evaluation Logic
+ * Endpoint: POST /api/evaluations/start
+ * ============================================================
+ */
+
+app.post("/api/evaluations/start", async (req, res) => {
+  // respond immediately (frontend can see "started")
+  res.json({ status: "Evaluation started" });
+
+  // evaluate domain by domain
+  for (const [domain, col] of Object.entries(domainCollections)) {
+    const docs = await col.find().toArray();
+    console.log(`Evaluating domain: ${domain} (${docs.length} questions)`);
+
+    for (let q of docs) {
+      const start = Date.now();
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "user",
+            content: `
+You are answering a multiple-choice question. Choices:
+
+A: ${q.choices.A}
+B: ${q.choices.B}
+C: ${q.choices.C}
+D: ${q.choices.D}
+
+Question: ${q.question}
+
+IMPORTANT:
+- Only answer with ONE letter: A, B, C, or D.
+- No explanation.
+            `,
+          },
+        ],
+      });
+
+      const end = Date.now();
+      const responseTime = end - start;
+
+      const rawAnswer = completion.choices[0].message.content;
+      const letter = extractLetter(rawAnswer);
+
+      // update MongoDB
+      await col.updateOne(
+        { _id: q._id },
+        {
+          $set: {
+            chatgpt_response: letter,
+            raw_gpt_text: rawAnswer,
+            responseTime,
+            evaluatedAt: new Date(),
+          },
+        }
+      );
+
+      // send real-time WS update
+      broadcast({
+        domain,
+        question: q.question,
+        answer: letter,
+        responseTime,
+      });
+    }
+  }
+
+  // notify frontend evaluation is fully completed
+  broadcast({ status: "done" });
+});
+
+/* ============================================================
+ * 7. Analysis Endpoint (For Chart.js Graphs)
+ * ============================================================
+ */
+
 app.get("/api/analysis", async (req, res) => {
   const results = [];
 
   for (const [domain, col] of Object.entries(domainCollections)) {
     const docs = await col.find().toArray();
-    if (docs.length === 0) continue;
+    if (!docs.length) continue;
 
-    // Accuracy
-    let correct = 0;
-    for (let d of docs) {
-      if (
-        d.chatgpt_response &&
-        d.expected_answer &&
-        d.chatgpt_response.trim().toLowerCase() ===
-          d.expected_answer.trim().toLowerCase()
-      ) {
-        correct++;
-      }
-    }
+    // compute accuracy
+    const correct = docs.filter(d =>
+      d.chatgpt_response &&
+      d.expected_answer &&
+      d.chatgpt_response.trim().toUpperCase() ===
+        d.expected_answer.trim().toUpperCase()
+    ).length;
+
     const accuracy = correct / docs.length;
 
-    // Average response time
-    const avgTime =
+    // compute avg response time
+    const avgResponseTime =
       docs.reduce((sum, d) => sum + (d.responseTime || 0), 0) /
       docs.length;
 
@@ -54,125 +207,24 @@ app.get("/api/analysis", async (req, res) => {
       domain,
       count: docs.length,
       accuracy,
-      avgResponseTime: avgTime,
+      avgResponseTime,
     });
   }
 
   res.json(results);
 });
 
-// --- OpenAI ---
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+/* ============================================================
+ * 8. Start Server + WebSocket Upgrade
+ * ============================================================
+ */
 
-// --- WebSocket ---
-const wss = new WebSocketServer({ noServer: true });
-const clients = new Set();
-
-wss.on("connection", (ws) => {
-  clients.add(ws);
-  ws.on("close", () => clients.delete(ws));
-});
-
-function broadcast(msg) {
-  for (let c of clients) {
-    c.send(JSON.stringify(msg));
-  }
-}
-
-// --- validator ---
-function validateQuery(req, res, next) {
-  if (!req.body.question) {
-    return res.status(400).json({ error: "Question field required." });
-  }
-  next();
-}
-
-// --- ROUTES ---
-
-// 获取全部 domain 的题目
-app.get("/api/questions", async (req, res) => {
-  const results = [];
-  for (const [domain, col] of Object.entries(domainCollections)) {
-    const docs = await col.find().toArray();
-    results.push({ domain, questions: docs });
-  }
-  res.json(results);
-});
-
-// （选用）新增题目 → 默认加到 Computer_Security 中
-app.post("/api/questions", validateQuery, async (req, res) => {
-  const col = domainCollections.Computer_Security;
-  const insert = await col.insertOne({
-    question: req.body.question,
-    expected_answer: req.body.expected_answer || "",
-    chatgpt_response: "",
-    createdAt: new Date(),
-  });
-
-  res.json({ success: true, id: insert.insertedId });
-});
-
-// --- 主功能：一次跑所有 domain ---
-app.post("/api/evaluations/start", async (req, res) => {
-  res.json({ status: "Evaluation started" });
-
-  for (const [domain, col] of Object.entries(domainCollections)) {
-    const questions = await col.find().toArray();
-    console.log(`Evaluating domain: ${domain} (${questions.length} questions)`);
-
-    for (let q of questions) {
-      const start = Date.now();
-
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: q.question }],
-      });
-
-      const end = Date.now();
-      const ms = end - start;
-
-      await col.updateOne(
-        { _id: q._id },
-        {
-          $set: {
-            chatgpt_response:
-              response.choices[0].message.content,
-            responseTime: ms,
-            evaluatedAt: new Date(),
-          },
-        }
-      );
-
-      broadcast({
-        domain,
-        question: q.question,
-        responseTime: ms,
-      });
-    }
-  }
-
-  broadcast({ done: true });
-});
-
-// --- 获取结果 ---
-app.get("/api/results", async (req, res) => {
-  const results = [];
-  for (const [domain, col] of Object.entries(domainCollections)) {
-    const docs = await col.find().toArray();
-    results.push({ domain, items: docs });
-  }
-  res.json(results);
-});
-
-// --- WebSocket upgrade ---
 const server = app.listen(3000, () =>
   console.log("Server running on http://localhost:3000")
 );
 
 server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
+  wss.handleUpgrade(req, socket, head, ws => {
     wss.emit("connection", ws, req);
   });
 });

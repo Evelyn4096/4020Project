@@ -1,0 +1,85 @@
+# ==========================
+# Node.js
+# ==========================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==========================
+# Environment Variables
+# ==========================
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Prevent .env.* inside subfolders
+**/.env
+
+# ==========================
+# Logs
+# ==========================
+logs
+*.log
+logs/*.log
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# ==========================
+# OS-specific
+# ==========================
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==========================
+# VSCode
+# ==========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# ==========================
+# Builds
+# ==========================
+dist/
+build/
+.out/
+coverage/
+
+# ==========================
+# Temporary files
+# ==========================
+*.tmp
+*.swp
+*.swo
+*.bak
+
+# ==========================
+# MongoDB dumps
+# ==========================
+dump/
+*.bson
+*.bak
+
+# ==========================
+# React
+# ==========================
+.cache/
+*.tsbuildinfo
+
+# ==========================
+# Other
+# ==========================
+*.local
