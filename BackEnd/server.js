@@ -184,7 +184,11 @@ const server = app.listen(PORT, "0.0.0.0",() =>
 );
 
 server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy(); // ❗ 必须丢弃非 WS 请求
+  }
 });
